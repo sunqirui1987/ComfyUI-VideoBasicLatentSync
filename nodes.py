@@ -5,6 +5,7 @@ import uuid
 import sys
 import shutil
 from collections.abc import Mapping
+import datetime
 
 # Function to find ComfyUI directories
 def get_comfyui_temp_dir():
@@ -344,7 +345,7 @@ def setup_models():
             print(f"   with whisper/tiny.pt in: {whisper_dir}")
             raise RuntimeError("Model download failed. See instructions above.")
 
-class LatentSyncNode:
+class VideoBasicLatentSyncNode:
     def __init__(self):
         # Make sure our temp directory is the current one
         global MODULE_TEMP_DIR
@@ -352,8 +353,8 @@ class LatentSyncNode:
             os.makedirs(MODULE_TEMP_DIR, exist_ok=True)
         
         # Ensure ComfyUI temp doesn't exist
-        comfyui_temp = "D:\\ComfyUI_windows\\temp"
-        if os.path.exists(comfyui_temp):
+        comfyui_temp = get_comfyui_temp_dir()
+        if comfyui_temp and os.path.exists(comfyui_temp):
             backup_name = f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}"
             try:
                 os.rename(comfyui_temp, backup_name)
@@ -366,8 +367,8 @@ class LatentSyncNode:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-                    "images": ("IMAGE",),
-                    "audio": ("AUDIO", ),
+                    "video_path": ("STRING", {"default": ""}),
+                    "audio_path": ("STRING", {"default": ""}),
                     "seed": ("INT", {"default": 1247}),
                     "lips_expression": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 3.0, "step": 0.1}),
                     "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
@@ -375,8 +376,8 @@ class LatentSyncNode:
 
     CATEGORY = "LatentSyncNode"
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio") 
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_path",) 
     FUNCTION = "inference"
 
     def process_batch(self, batch, use_mixed_precision=False):
@@ -390,9 +391,15 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20):
+    def inference(self, video_path, audio_path, seed, lips_expression=1.5, inference_steps=20):
         # Use our module temp directory
         global MODULE_TEMP_DIR
+        
+        # Validate input paths
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Input video file not found: {video_path}")
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Input audio file not found: {audio_path}")
         
         # Get GPU capabilities and memory
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -433,83 +440,23 @@ class LatentSyncNode:
         os.makedirs(temp_dir, exist_ok=True)
         
         # Ensure ComfyUI temp doesn't exist again (in case something recreated it)
-        comfyui_temp = "D:\\ComfyUI_windows\\temp"
-        if os.path.exists(comfyui_temp):
+        comfyui_temp = get_comfyui_temp_dir()
+        if comfyui_temp and os.path.exists(comfyui_temp):
             backup_name = f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}"
             try:
                 os.rename(comfyui_temp, backup_name)
             except:
                 pass
         
-        temp_video_path = None
         output_video_path = None
-        audio_path = None
 
         try:
-            # Create temporary file paths in our system temp directory
-            temp_video_path = os.path.join(temp_dir, f"temp_{run_id}.mp4")
+            # Create output video path in our system temp directory
             output_video_path = os.path.join(temp_dir, f"latentsync_{run_id}_out.mp4")
-            audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_audio.wav")
             
             # Get the extension directory
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             
-            # Process input frames
-            if isinstance(images, list):
-                frames = torch.stack(images).to(device)
-            else:
-                frames = images.to(device)
-            frames = (frames * 255).byte()
-
-            if len(frames.shape) == 3:
-                frames = frames.unsqueeze(0)
-
-            # Process audio with device awareness
-            waveform = audio["waveform"].to(device)
-            sample_rate = audio["sample_rate"]
-            if waveform.dim() == 3:
-                waveform = waveform.squeeze(0)
-
-            if sample_rate != 16000:
-                new_sample_rate = 16000
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate,
-                    new_freq=new_sample_rate
-                ).to(device)
-                waveform_16k = resampler(waveform)
-                waveform, sample_rate = waveform_16k, new_sample_rate
-
-            # Package resampled audio
-            resampled_audio = {
-                "waveform": waveform.unsqueeze(0),
-                "sample_rate": sample_rate
-            }
-            
-            # Move waveform to CPU for saving
-            waveform_cpu = waveform.cpu()
-            torchaudio.save(audio_path, waveform_cpu, sample_rate)
-
-            # Move frames to CPU for saving to video
-            frames_cpu = frames.cpu()
-            try:
-                import torchvision.io as io
-                io.write_video(temp_video_path, frames_cpu, fps=25, video_codec='h264')
-            except TypeError:
-                import av
-                container = av.open(temp_video_path, mode='w')
-                stream = container.add_stream('h264', rate=25)
-                stream.width = frames_cpu.shape[2]
-                stream.height = frames_cpu.shape[1]
-
-                for frame in frames_cpu:
-                    frame = av.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
-                    packet = stream.encode(frame)
-                    container.mux(packet)
-
-                packet = stream.encode(None)
-                container.mux(packet)
-                container.close()
-
             # Define paths to required files and configs
             inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
             config_path = os.path.join(cur_dir, "configs", "unet", "stage2.yaml")
@@ -538,7 +485,7 @@ class LatentSyncNode:
             args = argparse.Namespace(
                 unet_config_path=config_path,
                 inference_ckpt_path=ckpt_path,
-                video_path=temp_video_path,
+                video_path=video_path,
                 audio_path=audio_path,
                 video_out_path=output_video_path,
                 seed=seed,
@@ -565,7 +512,8 @@ class LatentSyncNode:
                 torch.cuda.empty_cache()
                 
             # Check and prevent ComfyUI temp creation again
-            if os.path.exists(comfyui_temp):
+            comfyui_temp = get_comfyui_temp_dir()
+            if comfyui_temp and os.path.exists(comfyui_temp):
                 try:
                     os.rename(comfyui_temp, f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}")
                 except:
@@ -593,18 +541,18 @@ class LatentSyncNode:
             if not os.path.exists(output_video_path):
                 raise FileNotFoundError(f"Output video not found at: {output_video_path}")
             
-            # Read the processed video - ensure it's loaded as CPU tensor
-            processed_frames = io.read_video(output_video_path, pts_unit='sec')[0]
-            processed_frames = processed_frames.float() / 255.0
-
-            # Ensure audio is on CPU before returning
-            if torch.cuda.is_available():
-                if hasattr(resampled_audio["waveform"], 'device') and resampled_audio["waveform"].device.type == 'cuda':
-                    resampled_audio["waveform"] = resampled_audio["waveform"].cpu()
-                if hasattr(processed_frames, 'device') and processed_frames.device.type == 'cuda':
-                    processed_frames = processed_frames.cpu()
-
-            return (processed_frames, resampled_audio)
+            # Create a permanent output location
+            output_dir = os.path.join(get_ext_dir(), "outputs")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate a unique filename for the permanent output
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            permanent_output_path = os.path.join(output_dir, f"latentsync_output_{timestamp}.mp4")
+            
+            # Copy the output file to the permanent location
+            shutil.copy2(output_video_path, permanent_output_path)
+            
+            return (permanent_output_path,)
 
         except Exception as e:
             print(f"Error during inference: {str(e)}")
@@ -613,14 +561,13 @@ class LatentSyncNode:
             raise
 
         finally:
-            # Clean up temporary files individually
-            for path in [temp_video_path, output_video_path, audio_path]:
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                        print(f"Removed temporary file: {path}")
-                    except Exception as e:
-                        print(f"Failed to remove {path}: {str(e)}")
+            # Clean up temporary files
+            if output_video_path and os.path.exists(output_video_path):
+                try:
+                    os.remove(output_video_path)
+                    print(f"Removed temporary file: {output_video_path}")
+                except Exception as e:
+                    print(f"Failed to remove {output_video_path}: {str(e)}")
 
             # Remove temporary run directory
             if temp_dir and os.path.exists(temp_dir):
@@ -637,13 +584,13 @@ class LatentSyncNode:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-class VideoLengthAdjuster:
+class VideoBasicLatentSyncLengthAdjuster:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "audio": ("AUDIO",),
+                "video_path": ("STRING", {"default": ""}),
+                "audio_path": ("STRING", {"default": ""}),
                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
                 "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0}),
                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1}),
@@ -651,100 +598,217 @@ class VideoLengthAdjuster:
         }
 
     CATEGORY = "LatentSyncNode"
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_path",)
     FUNCTION = "adjust"
 
-    def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5):
-        waveform = audio["waveform"].squeeze(0)
-        sample_rate = int(audio["sample_rate"])
-        original_frames = [images[i] for i in range(images.shape[0])] if isinstance(images, torch.Tensor) else images.copy()
-
-        if mode == "normal":
-            # Add silent padding to the audio and then trim video to match
-            audio_duration = waveform.shape[1] / sample_rate
+    def adjust(self, video_path, audio_path, mode, fps=25.0, silent_padding_sec=0.5):
+        # Validate input paths
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Input video file not found: {video_path}")
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Input audio file not found: {audio_path}")
+        
+        # Use our module temp directory
+        global MODULE_TEMP_DIR
+        
+        # Create a run-specific subdirectory in our temp directory
+        run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+        temp_dir = os.path.join(MODULE_TEMP_DIR, f"vla_run_{run_id}")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Create output video path in our system temp directory
+        output_video_path = os.path.join(temp_dir, f"adjusted_{run_id}.mp4")
+        
+        try:
+            # Load audio file
+            waveform, sample_rate = torchaudio.load(audio_path)
             
-            # Add silent padding to the audio
-            silence_samples = math.ceil(silent_padding_sec * sample_rate)
-            silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-            padded_audio = torch.cat([waveform, silence], dim=1)
+            # Extract frames from video using ffmpeg
+            import ffmpeg
             
-            # Calculate required frames based on the padded audio
-            padded_audio_duration = (waveform.shape[1] + silence_samples) / sample_rate
-            required_frames = int(padded_audio_duration * fps)
+            # Get video info
+            probe = ffmpeg.probe(video_path)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            original_fps = float(eval(video_info.get('r_frame_rate', str(fps))))
+            width = int(video_info['width'])
+            height = int(video_info['height'])
             
-            if len(original_frames) > required_frames:
-                # Trim video frames to match padded audio duration
-                adjusted_frames = original_frames[:required_frames]
-            else:
-                # If video is shorter than padded audio, keep all video frames
-                # and trim the audio accordingly
-                adjusted_frames = original_frames
-                required_samples = int(len(original_frames) / fps * sample_rate)
-                padded_audio = padded_audio[:, :required_samples]
+            # Create temp directory for frames
+            frames_dir = os.path.join(temp_dir, "frames")
+            os.makedirs(frames_dir, exist_ok=True)
             
-            return (
-                torch.stack(adjusted_frames),
-                {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+            # Extract frames
+            (
+                ffmpeg
+                .input(video_path)
+                .output(os.path.join(frames_dir, "frame%04d.png"), r=original_fps)
+                .run(quiet=True, overwrite_output=True)
             )
             
-            # This return statement is no longer needed as it's handled in the updated code
-
-        elif mode == "pingpong":
-            video_duration = len(original_frames) / fps
-            audio_duration = waveform.shape[1] / sample_rate
-            if audio_duration <= video_duration:
-                required_samples = int(video_duration * sample_rate)
-                silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
-                adjusted_audio = torch.cat([waveform, silence], dim=1)
-
-                return (
-                    torch.stack(original_frames),
-                    {"waveform": adjusted_audio.unsqueeze(0), "sample_rate": sample_rate}
-                )
-
-            else:
+            # Get list of frames
+            frame_files = sorted([f for f in os.listdir(frames_dir) if f.startswith("frame") and f.endswith(".png")])
+            
+            # Process based on mode
+            if mode == "normal":
+                # Add silent padding to the audio
+                audio_duration = waveform.shape[1] / sample_rate
+                silence_samples = math.ceil(silent_padding_sec * sample_rate)
+                silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+                padded_audio = torch.cat([waveform, silence], dim=1)
+                
+                # Calculate required frames based on the padded audio
+                padded_audio_duration = (waveform.shape[1] + silence_samples) / sample_rate
+                required_frames = int(padded_audio_duration * fps)
+                
+                if len(frame_files) > required_frames:
+                    # Trim video frames to match padded audio duration
+                    adjusted_frames = frame_files[:required_frames]
+                else:
+                    # If video is shorter than padded audio, keep all video frames
+                    # and trim the audio accordingly
+                    adjusted_frames = frame_files
+                    required_samples = int(len(frame_files) / fps * sample_rate)
+                    padded_audio = padded_audio[:, :required_samples]
+                
+                # Save adjusted audio
+                temp_audio_path = os.path.join(temp_dir, "adjusted_audio.wav")
+                torchaudio.save(temp_audio_path, padded_audio.unsqueeze(0), sample_rate)
+                
+                # Create output directory for adjusted frames
+                adjusted_frames_dir = os.path.join(temp_dir, "adjusted_frames")
+                os.makedirs(adjusted_frames_dir, exist_ok=True)
+                
+                # Copy selected frames to adjusted directory
+                for i, frame in enumerate(adjusted_frames):
+                    shutil.copy2(
+                        os.path.join(frames_dir, frame),
+                        os.path.join(adjusted_frames_dir, f"adjusted_frame{i:04d}.png")
+                    )
+                
+            elif mode == "pingpong":
+                video_duration = len(frame_files) / original_fps
+                audio_duration = waveform.shape[1] / sample_rate
+                
+                if audio_duration <= video_duration:
+                    # Audio is shorter than video, pad with silence
+                    required_samples = int(video_duration * sample_rate)
+                    silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
+                    adjusted_audio = torch.cat([waveform, silence], dim=1)
+                    
+                    # Save adjusted audio
+                    temp_audio_path = os.path.join(temp_dir, "adjusted_audio.wav")
+                    torchaudio.save(temp_audio_path, adjusted_audio.unsqueeze(0), sample_rate)
+                    
+                    # Use all original frames
+                    adjusted_frames_dir = frames_dir
+                    
+                else:
+                    # Audio is longer than video, create pingpong effect
+                    silence_samples = math.ceil(silent_padding_sec * sample_rate)
+                    silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+                    padded_audio = torch.cat([waveform, silence], dim=1)
+                    total_duration = (waveform.shape[1] + silence_samples) / sample_rate
+                    target_frames = math.ceil(total_duration * fps)
+                    
+                    # Create pingpong frame sequence
+                    reversed_frames = frame_files[::-1][1:-1]  # Remove endpoints
+                    pingpong_frames = frame_files + reversed_frames
+                    
+                    # Loop if needed
+                    while len(pingpong_frames) < target_frames:
+                        pingpong_frames += pingpong_frames[:target_frames - len(pingpong_frames)]
+                    
+                    # Save adjusted audio
+                    temp_audio_path = os.path.join(temp_dir, "adjusted_audio.wav")
+                    torchaudio.save(temp_audio_path, padded_audio.unsqueeze(0), sample_rate)
+                    
+                    # Create output directory for adjusted frames
+                    adjusted_frames_dir = os.path.join(temp_dir, "adjusted_frames")
+                    os.makedirs(adjusted_frames_dir, exist_ok=True)
+                    
+                    # Copy selected frames to adjusted directory
+                    for i, frame in enumerate(pingpong_frames[:target_frames]):
+                        source_frame = os.path.join(frames_dir, frame_files[int(frame_files.index(frame) if frame in frame_files else 0)])
+                        shutil.copy2(
+                            source_frame,
+                            os.path.join(adjusted_frames_dir, f"adjusted_frame{i:04d}.png")
+                        )
+                
+            elif mode == "loop_to_audio":
+                # Add silent padding then simple loop
                 silence_samples = math.ceil(silent_padding_sec * sample_rate)
                 silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
                 padded_audio = torch.cat([waveform, silence], dim=1)
                 total_duration = (waveform.shape[1] + silence_samples) / sample_rate
                 target_frames = math.ceil(total_duration * fps)
-                reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
-                frames = original_frames + reversed_frames
-                while len(frames) < target_frames:
-                    frames += frames[:target_frames - len(frames)]
-                return (
-                    torch.stack(frames[:target_frames]),
-                    {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-                )
-
-        elif mode == "loop_to_audio":
-            # Add silent padding then simple loop
-            silence_samples = math.ceil(silent_padding_sec * sample_rate)
-            silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-            padded_audio = torch.cat([waveform, silence], dim=1)
-            total_duration = (waveform.shape[1] + silence_samples) / sample_rate
-            target_frames = math.ceil(total_duration * fps)
-
-            frames = original_frames.copy()
-            while len(frames) < target_frames:
-                frames += original_frames[:target_frames - len(frames)]
+                
+                # Create looped frame sequence
+                looped_frames = []
+                while len(looped_frames) < target_frames:
+                    looped_frames += frame_files[:target_frames - len(looped_frames)]
+                
+                # Save adjusted audio
+                temp_audio_path = os.path.join(temp_dir, "adjusted_audio.wav")
+                torchaudio.save(temp_audio_path, padded_audio.unsqueeze(0), sample_rate)
+                
+                # Create output directory for adjusted frames
+                adjusted_frames_dir = os.path.join(temp_dir, "adjusted_frames")
+                os.makedirs(adjusted_frames_dir, exist_ok=True)
+                
+                # Copy selected frames to adjusted directory
+                for i, frame in enumerate(looped_frames[:target_frames]):
+                    source_frame = os.path.join(frames_dir, frame)
+                    shutil.copy2(
+                        source_frame,
+                        os.path.join(adjusted_frames_dir, f"adjusted_frame{i:04d}.png")
+                    )
             
-            return (
-                torch.stack(frames[:target_frames]),
-                {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+            # Combine frames and audio into output video
+            (
+                ffmpeg
+                .input(os.path.join(adjusted_frames_dir, "adjusted_frame%04d.png"), r=fps)
+                .input(temp_audio_path)
+                .output(output_video_path, vcodec='libx264', pix_fmt='yuv420p', acodec='aac', strict='experimental')
+                .run(quiet=True, overwrite_output=True)
             )
-
-
+            
+            # Create a permanent output location
+            output_dir = os.path.join(get_ext_dir(), "outputs")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate a unique filename for the permanent output
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            permanent_output_path = os.path.join(output_dir, f"adjusted_video_{timestamp}.mp4")
+            
+            # Copy the output file to the permanent location
+            shutil.copy2(output_video_path, permanent_output_path)
+            
+            return (permanent_output_path,)
+            
+        except Exception as e:
+            print(f"Error during video length adjustment: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+            
+        finally:
+            # Clean up temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    print(f"Removed temporary directory: {temp_dir}")
+                except Exception as e:
+                    print(f"Failed to remove temp directory: {str(e)}")
 
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
-    "LatentSyncNode": LatentSyncNode,
-    "VideoLengthAdjuster": VideoLengthAdjuster,
+    "VideoBasicLatentSyncNode": VideoBasicLatentSyncNode,
+    "VideoBasicLatentSyncLengthAdjuster": VideoBasicLatentSyncLengthAdjuster,
 }
 
 # Display Names for ComfyUI
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LatentSyncNode": "LatentSync1.5 Node",
-    "VideoLengthAdjuster": "Video Length Adjuster",
+    "VideoBasicLatentSyncNode": "VideoBasic LatentSync Node",
+    "VideoBasicLatentSyncLengthAdjuster": "VideoBasic LatentSync Length Adjuster",
  }

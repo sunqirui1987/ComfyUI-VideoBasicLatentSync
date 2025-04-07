@@ -1,3 +1,13 @@
+# ComfyUI-VideoBasicLatentSync
+
+Optimize OOM issues based on ComfyUI-LatentSyncWrapper.
+https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper
+
+
+VideBasic Optimize OOM Plan:
+https://github.com/jax-explorer/ComfyUI-VideoBasic
+
+
 # ComfyUI-LatentSyncWrapper 1.5
 
 ## Support My Work
