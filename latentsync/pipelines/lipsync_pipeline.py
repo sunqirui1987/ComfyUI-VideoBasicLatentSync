@@ -344,9 +344,6 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames = video_frames[: num_inferences * num_frames]
         faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
 
-        synced_video_frames = []
-        masked_video_frames = []
-
         num_channels_latents = self.vae.config.latent_channels
 
         # Prepare latent variables
@@ -360,7 +357,17 @@ class LipsyncPipeline(DiffusionPipeline):
             device,
             generator,
         )
-
+        
+        # Set up temp directory for saving frames
+        temp_dir = "temp"
+        frames_dir = os.path.join(temp_dir, "frames")
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+        os.makedirs(frames_dir, exist_ok=True)
+        
+        frame_index = 0
+        
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
             if self.denoising_unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
@@ -435,31 +442,40 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
-            # masked_video_frames.append(masked_pixel_values)
+            
+            # Process batch and save frames to disk
+            batch_frames = self.restore_video(
+                decoded_latents, video_frames[i * num_frames : (i + 1) * num_frames], 
+                boxes[i * num_frames : (i + 1) * num_frames], 
+                affine_matrices[i * num_frames : (i + 1) * num_frames]
+            )
+            
+            # Save each frame in this batch as a JPG
+            for frame in batch_frames:
+                cv2.imwrite(os.path.join(frames_dir, f"frame_{frame_index:06d}.jpg"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                frame_index += 1
+            
+            # Clear CUDA cache to prevent memory issues
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        synced_video_frames = self.restore_video(
-            torch.cat(synced_video_frames), video_frames, boxes, affine_matrices
-        )
-        # masked_video_frames = self.restore_video(
-        #     torch.cat(masked_video_frames), video_frames, boxes, affine_matrices
-        # )
-
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        audio_samples_remain_length = int(frame_index / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
 
         if is_train:
             self.denoising_unet.train()
 
-        temp_dir = "temp"
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir, exist_ok=True)
-
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=25)
-        # write_video(video_mask_path, masked_video_frames, fps=25)
-
+        # Save audio
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
-
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        
+        # Create video from frames using ffmpeg
+        frames_path = os.path.join(frames_dir, "frame_%06d.jpg")
+        video_temp_path = os.path.join(temp_dir, "video.mp4")
+        
+        # Create video from frames
+        command = f"ffmpeg -y -loglevel error -framerate {video_fps} -i {frames_path} -c:v libx264 -pix_fmt yuv420p {video_temp_path}"
+        subprocess.run(command, shell=True)
+        
+        # Combine video and audio
+        command = f"ffmpeg -y -loglevel error -nostdin -i {video_temp_path} -i {os.path.join(temp_dir, 'audio.wav')} -c:v copy -c:a aac -q:v 0 -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
