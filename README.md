@@ -51,7 +51,7 @@ Only proceed with installation after confirming all prerequisites are installed 
 1. Clone this repository into your ComfyUI custom_nodes directory:
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper.git
+git clone https://github.com/sunqirui1987/ComfyUI-VideoBasicLatentSync
 cd ComfyUI-LatentSyncWrapper
 pip install -r requirements.txt
 ```
